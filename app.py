@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from datetime import datetime, timedelta
 import uuid
@@ -24,7 +24,7 @@ def create_access_token(user_id: str) -> str:
 def require_auth():
     def decorator(f):
         @wraps(f)
-        def wrapped(*args, **kwargs):
+        async def wrapped(*args, **kwargs):
             token = request.headers.get('Authorization')
             if not token or not token.startswith('Bearer '):
                 return jsonify({"error": "Missing or invalid authorization token"}), 401
@@ -36,20 +36,21 @@ def require_auth():
                     Config.JWT_SECRET_KEY, 
                     algorithms=[Config.JWT_ALGORITHM]
                 )
-                request.user_id = payload['user_id']
+                g.user_id = payload['user_id']
             except jwt.ExpiredSignatureError:
                 return jsonify({"error": "Token has expired"}), 401
             except jwt.InvalidTokenError:
                 return jsonify({"error": "Invalid token"}), 401
                 
-            return f(*args, **kwargs)
+            return await f(*args, **kwargs)
         return wrapped
     return decorator
 
 # Add request validation middleware
 def validate_request_json(required_fields: Dict[str, Any]):
     def decorator(f):
-        def wrapper(*args, **kwargs):
+        @wraps(f)  # Add wraps to preserve function metadata
+        async def wrapper(*args, **kwargs):
             if not request.is_json:
                 return jsonify({"error": "Content-Type must be application/json"}), 400
             
@@ -61,8 +62,7 @@ def validate_request_json(required_fields: Dict[str, Any]):
                     "error": f"Missing required fields: {', '.join(missing_fields)}"
                 }), 400
                 
-            return f(*args, **kwargs)
-        wrapper.__name__ = f.__name__
+            return await f(*args, **kwargs)
         return wrapper
     return decorator
 
@@ -104,22 +104,34 @@ async def get_user(user_id):
 
 # Song routes
 @app.route('/api/songs', methods=['POST'])
+@require_auth()
+@validate_request_json(['title', 'artist', 'album', 'duration', 'genre', 'release_date', 'audio_url'])
 async def create_song():
     data = request.json
-    song = Song(
-        id=str(uuid.uuid4()),
-        title=data['title'],
-        artist=data['artist'],
-        album=data['album'],
-        duration=data['duration'],
-        genre=data['genre'],
-        release_date=datetime.fromisoformat(data['release_date']),
-        audio_url=data['audio_url'],
-        cover_image=data['cover_image'],
-        created_at=datetime.now()
-    )
-    song_id = await Database.create_song(song)
-    return jsonify({"message": "Song created successfully", "song_id": song_id}), 201
+    try:
+        # Validate duration is positive
+        if not isinstance(data['duration'], int) or data['duration'] <= 0:
+            return jsonify({"error": "Duration must be a positive integer"}), 400
+            
+        # Validate release_date format
+        release_date = datetime.fromisoformat(data['release_date'])
+        
+        song = Song(
+            id=str(uuid.uuid4()),
+            title=data['title'],
+            artist=data['artist'],
+            album=data['album'],
+            duration=data['duration'],
+            genre=data['genre'],
+            release_date=release_date,
+            audio_url=data['audio_url'],
+            cover_image=data.get('cover_image', ''),  # Make cover_image optional
+            created_at=datetime.now()
+        )
+        song_id = await Database.create_song(song)
+        return jsonify({"message": "Song created successfully", "song_id": song_id}), 201
+    except ValueError as e:
+        return jsonify({"error": f"Invalid date format: {str(e)}"}), 400
 
 @app.route('/api/songs/<song_id>', methods=['GET'])
 async def get_song(song_id):
@@ -131,8 +143,23 @@ async def get_song(song_id):
 @app.route('/api/songs/search', methods=['GET'])
 async def search_songs():
     query = request.args.get('q', '')
-    songs = await Database.search_songs(query)
-    return jsonify([song.dict() for song in songs]), 200
+    page = int(request.args.get('page', 1))
+    per_page = int(request.args.get('per_page', 20))
+    
+    if len(query) < 2:
+        return jsonify({
+            "error": "Search query must be at least 2 characters long"
+        }), 400
+        
+    try:
+        songs = await Database.search_songs(query, page, per_page)
+        return jsonify({
+            "songs": [song.dict() for song in songs],
+            "page": page,
+            "per_page": per_page
+        }), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
 # Playlist routes
 @app.route('/api/playlists', methods=['POST'])
@@ -140,31 +167,38 @@ async def search_songs():
 @validate_request_json(['name'])
 async def create_playlist():
     data = request.json
-    playlist = Playlist(
-        id=str(uuid.uuid4()),
-        name=data['name'],
-        description=data.get('description'),
-        owner_id=request.user_id,  # Use authenticated user's ID
-        songs=data.get('songs', []),
-        followers=[],  # Initialize empty
-        cover_image=data.get('cover_image'),
-        created_at=datetime.now(),
-        updated_at=datetime.now()
-    )
-    
-    # Validate that all song IDs exist
-    if playlist.songs:
-        for song_id in playlist.songs:
-            if not await Database.get_song(song_id):
+    try:
+        playlist = Playlist(
+            id=str(uuid.uuid4()),
+            name=data['name'],
+            description=data.get('description', ''),
+            owner_id=g.user_id,  # Use g.user_id instead of request.user_id
+            songs=data.get('songs', []),
+            followers=[],
+            cover_image=data.get('cover_image', ''),
+            created_at=datetime.now(),
+            updated_at=datetime.now()
+        )
+        
+        # Validate that all song IDs exist
+        if playlist.songs:
+            invalid_songs = []
+            for song_id in playlist.songs:
+                if not await Database.get_song(song_id):
+                    invalid_songs.append(song_id)
+            
+            if invalid_songs:
                 return jsonify({
-                    "error": f"Song with ID {song_id} does not exist"
+                    "error": f"Invalid song IDs: {', '.join(invalid_songs)}"
                 }), 400
-    
-    playlist_id = await Database.create_playlist(playlist)
-    return jsonify({
-        "message": "Playlist created successfully",
-        "playlist_id": playlist_id
-    }), 201
+        
+        playlist_id = await Database.create_playlist(playlist)
+        return jsonify({
+            "message": "Playlist created successfully",
+            "playlist_id": playlist_id
+        }), 201
+    except Exception as e:
+        return jsonify({"error": f"Failed to create playlist: {str(e)}"}), 500
 
 @app.route('/api/playlists/<playlist_id>', methods=['GET'])
 async def get_playlist(playlist_id):
@@ -183,7 +217,7 @@ async def update_playlist(playlist_id):
     if not playlist:
         return jsonify({"error": "Playlist not found"}), 404
     
-    if playlist.owner_id != request.user_id:
+    if playlist.owner_id != g.user_id:
         return jsonify({"error": "Not authorized to modify this playlist"}), 403
     
     # Validate song IDs if they're being updated
@@ -206,10 +240,18 @@ async def get_user_playlists(user_id):
 @app.errorhandler(Exception)
 def handle_error(error):
     code = 500
+    message = str(error)
+    
     if isinstance(error, HTTPException):
         code = error.code
+    elif isinstance(error, ValueError):
+        code = 400
+    elif isinstance(error, jwt.InvalidTokenError):
+        code = 401
+        message = "Invalid authentication token"
+    
     return jsonify({
-        'error': str(error),
+        'error': message,
         'status_code': code
     }), code
 

@@ -69,7 +69,8 @@ class Database:
         return False
 
     @staticmethod
-    async def search_songs(query: str) -> List[Song]:
+    async def search_songs(query: str, page: int = 1, per_page: int = 20) -> List[Song]:
+        # Implementation here
         songs_ref = db.collection('songs')
         query = query.lower()
         results = []
