@@ -49,7 +49,7 @@ def require_auth():
 # Add request validation middleware
 def validate_request_json(required_fields: Dict[str, Any]):
     def decorator(f):
-        @wraps(f)  # Add wraps to preserve function metadata
+        @wraps(f)
         async def wrapper(*args, **kwargs):
             if not request.is_json:
                 return jsonify({"error": "Content-Type must be application/json"}), 400
@@ -167,38 +167,31 @@ async def search_songs():
 @validate_request_json(['name'])
 async def create_playlist():
     data = request.json
-    try:
-        playlist = Playlist(
-            id=str(uuid.uuid4()),
-            name=data['name'],
-            description=data.get('description', ''),
-            owner_id=g.user_id,  # Use g.user_id instead of request.user_id
-            songs=data.get('songs', []),
-            followers=[],
-            cover_image=data.get('cover_image', ''),
-            created_at=datetime.now(),
-            updated_at=datetime.now()
-        )
-        
-        # Validate that all song IDs exist
-        if playlist.songs:
-            invalid_songs = []
-            for song_id in playlist.songs:
-                if not await Database.get_song(song_id):
-                    invalid_songs.append(song_id)
-            
-            if invalid_songs:
+    playlist = Playlist(
+        id=str(uuid.uuid4()),
+        name=data['name'],
+        description=data.get('description'),
+        owner_id=g.user_id,
+        songs=data.get('songs', []),
+        followers=[],
+        cover_image=data.get('cover_image'),
+        created_at=datetime.now(),
+        updated_at=datetime.now()
+    )
+    
+    # Validate that all song IDs exist
+    if playlist.songs:
+        for song_id in playlist.songs:
+            if not await Database.get_song(song_id):
                 return jsonify({
-                    "error": f"Invalid song IDs: {', '.join(invalid_songs)}"
+                    "error": f"Song with ID {song_id} does not exist"
                 }), 400
-        
-        playlist_id = await Database.create_playlist(playlist)
-        return jsonify({
-            "message": "Playlist created successfully",
-            "playlist_id": playlist_id
-        }), 201
-    except Exception as e:
-        return jsonify({"error": f"Failed to create playlist: {str(e)}"}), 500
+    
+    playlist_id = await Database.create_playlist(playlist)
+    return jsonify({
+        "message": "Playlist created successfully",
+        "playlist_id": playlist_id
+    }), 201
 
 @app.route('/api/playlists/<playlist_id>', methods=['GET'])
 async def get_playlist(playlist_id):
